@@ -4,6 +4,9 @@ import numpy as np
 import torch
 from simulator import CheckerBoard
 from infra import master_store
+from models import create_input,history_dim
+import os
+import random
 
 # alphazero values
 c1 = 1.25
@@ -12,41 +15,68 @@ c2 = 19652
 num_iters = 800
 
 def play_game(board : CheckerBoard):
+    game_id = os.getpid() 
     player_bit = 1 
-    max_num_iters = 1000
+    max_num_iters = 100
     counter = 0
+    history = []
     while not board.game_over() and counter < max_num_iters:
         player = "white" if player_bit else "black"
-        action = run_mcts(board, player) 
+        board_tensor = board.as_tensor()
+        # list of indices corresponding to valid actions, out of the total 10_000
+        legal_action_ids, legal_actions = board.get_valid_actions()
+
+        # what to do if history not yet of history_dim? take random actions
+        if len(history) < history_dim:
+            action = random.choice(legal_action_ids) 
+        else:
+            # we create a state that has the player as the last plane
+            state_with_player = create_input(board_tensor, player)
+            # compute the initial hidden state
+            init_hidden_state = master_store["batch_store"].repr_fn(state_with_player).result()
+            # TODO handle actions properly
+            action_idx, mcts_policy = run_mcts(init_hidden_state, legal_action_ids, game_id)
+            action = legal_actions[action_idx]
+            # we don't store the hidden state, but the actual board state
+            master_store["experience_store"].add_experience(game_id, state_with_player, mcts_policy)
+
+        # actually execute that action, ie materialises it on the board
         board.execute(action, player)
+
+        # switch player
         player_bit ^= 1
+
+        history.append(board_tensor)
+        history = history[-history_dim:]
         counter += 1
 
-def run_mcts(board : CheckerBoard, player):
-    # compute hidden state
-    init_state = master_store["batch_store"].repr_fn(board.as_tensor()).result()
-    legal_actions_init = board.get_valid_actions()
-    root = MCTSNode(init_state, None, len(legal_actions_init))
+def run_mcts(root_hidden_state : torch.Tensor, legal_actions, game_id):
+    root = MCTSNode(root_hidden_state, None)
     for _ in range(num_iters):
         root.traverse()
     
-    # select child node with greatest visit count
-    action, _ = max(root.children.items(), key=lambda x: x[1].count)
-    return legal_actions_init[action]
+    # normalised counts == mcts policy 
+    masked_policy = [root.children[action].count if action in legal_actions else 0 for action in range(root.num_actions)]
+    denominator = sum(masked_policy)
+    norm_masked_policy = [val / denominator for val in masked_policy]
+
+    # select valid action with highest visit count 
+    action_idx = np.argmax(np.array(norm_masked_policy)) 
+    return action_idx, norm_masked_policy 
 
 
 class MCTSNode:
-    def __init__(self, state, parent, num_legal_actions=None):
-        self.is_root = num_legal_actions is not None 
+    def __init__(self, state, parent):
+        self.is_root = parent is None
         # hidden state
-        self.state = master_store["batch_store"].repr_fn(state).result() if self.is_root else state
-        # map of action -> node
+        self.state = state 
+        # map of action -> child_node
         self.children = {}
         self.parent : MCTSNode = parent
         self.count = 0
         self.q_value = 0
 
-        self.num_actions = num_legal_actions if self.is_root else 10_000
+        self.num_actions = 10_000
         # P(s,a) for all actions
         self.child_priors, self.value = master_store["batch_store"].policy_fn(self.state).result()
     
@@ -55,6 +85,8 @@ class MCTSNode:
         print(f"Visit Count: {self.count}")
         print(f"Q-value: {self.q_value}")
         print(f"Root? : {self.is_root}")
+        print(f"Policy : {self.child_priors}")
+        print(f"V(s): {self.value}")
 
     # selects which path to go down
     def select(self):

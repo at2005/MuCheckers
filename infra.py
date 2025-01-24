@@ -74,8 +74,8 @@ class ReplayBuffer():
     # what do we really need to store here? 
     # we want to store the root game state, the MCTS generated policy vector
     # and the game_id
-    def add_experience(self, game_id, root_state, mcts_policy, player):
-        self.store.put((game_id, root_state, mcts_policy, player))
+    def add_experience(self, game_id, state, mcts_policy, player):
+        self.store.put((game_id, state, mcts_policy, player))
 
  
 def init_pool(master_store_,):
@@ -86,7 +86,7 @@ def multithreaded_search():
     num_processes = 1#mp.cpu_count()
     with mp.Manager() as manager:
         master_store = manager.dict()
-        master_store["experience_buffer"] = ReplayBuffer()
+        master_store["experience_store"] = ReplayBuffer()
         master_store["batch_store"] = BatchEngine()
         with mp.Pool(processes=num_processes, initializer=init_pool, initargs=(master_store,)) as pool:
             new_games = [CheckerBoard() for _ in range(num_processes)]

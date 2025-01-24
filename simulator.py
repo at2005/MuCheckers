@@ -28,6 +28,20 @@ class CheckerBoard:
     def check_valid_move(self, player_board, opponent_board, x, y):
         return self.check_bounds(x, y) and opponent_board[x][y] == 0 and player_board[x][y] == 0
 
+    def flattened_action_to_tesseract(self, action_idx):
+        board_dim_sq = self.board_dim ** 2
+        src_term = action_idx // board_dim_sq 
+        dest_term = action_idx % board_dim_sq
+
+        i = src_term // self.board_dim
+        j = src_term % self.board_dim
+
+        x = dest_term // self.board_dim
+        y = dest_term % self.board_dim
+
+        return (i,j), (x,y)
+
+
     def get_valid_actions(self, player):
         player_board = self.whites if player == "white" else self.blacks
         opponent_board = self.whites if player == "black" else self.blacks
@@ -35,9 +49,9 @@ class CheckerBoard:
         valid_actions = []
         for i in range(self.board_dim):
             for j in range(self.board_dim):
+                action_base_idx = (i * self.board_dim + j) * (self.board_dim ** 2)
                 if player_board[i][j] == 0:
                     continue
-                
                 simple_move_positions = [(i-1, j+1), (i-1, j-1)] if player == "white" else [(i+1, j+1), (i+1, j-1)] 
                 simple_move_positions = filter(lambda pos: self.check_valid_move(player_board, opponent_board, pos[0], pos[1]), simple_move_positions)
                 capture_move_positions = [(i+2, j+2), (i-2, j+2), (i+2, j-2), (i-2, j-2)]
@@ -49,8 +63,9 @@ class CheckerBoard:
                     dest_board = np.zeros_like(player_board)
                     src_board[i][j] = 1.0
                     dest_board[x][y] = 1.0
+                    action_flattened_idx = action_base_idx + (x * self.board_dim + y)
                     action_cat = np.concatenate([src_board, dest_board])
-                    valid_actions.append(action_cat)
+                    valid_actions.append((action_flattened_idx, action_cat))
                 
                 for capture_position in capture_move_positions:
                     x,y = capture_position
@@ -61,10 +76,11 @@ class CheckerBoard:
                         dest_board = np.zeros_like(player_board)
                         src_board[i][j] = 1.0
                         dest_board[x][y] = 1.0
+                        action_flattened_idx = action_base_idx + (x * self.board_dim + y)
                         action_cat = np.concatenate([src_board, dest_board])
-                        valid_actions.append(action_cat)
+                        valid_actions.append((action_flattened_idx, action_cat))
 
-        return valid_actions
+        return zip(*valid_actions)
 
     def execute(self, action : torch.Tensor, player):
         action_arr = action.cpu().numpy()
