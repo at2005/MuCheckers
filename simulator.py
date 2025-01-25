@@ -113,6 +113,13 @@ class CheckerBoard:
         if np.all(self.whites == 0) or np.all(self.blacks == 0):
             return True 
         return False 
+    
+    def who_won(self):
+        if np.all(self.whites == 0):
+            return "black"
+        if np.all(self.blacks == 0):
+            return "white"
+        return None
 
     def assertion_tests(self):
         assert len(state.get_valid_actions("white")) == 9 and len(state.get_valid_actions("black")) == 9

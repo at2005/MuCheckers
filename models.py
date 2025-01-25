@@ -105,16 +105,3 @@ class DynamicsNet(nn.Module):
         for block in self.blocks:
             x = F.relu(x + block(x))
         return x 
-
-# world_model = RepresentationNet().to(device)
-# policy = PolicyNet().to(device)
-# B = 10
-# H = 10
-# W = 10
-# C = history_dim * 2
-# test_tensor = torch.randn(B, C, H, W, device=device)
-# test_tensor = create_input(test_tensor, "white")
-# hidden_state = world_model(test_tensor)
-# p,v = policy(hidden_state)
-# print(p.shape)
-# print(v.shape)

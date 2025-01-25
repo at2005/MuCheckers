@@ -3,7 +3,7 @@ import multiprocessing as mp
 import numpy as np
 import torch
 from simulator import CheckerBoard
-from infra import master_store
+from infra import get_experience_store, get_batch_store
 from models import create_input,history_dim
 import os
 import random
@@ -13,14 +13,34 @@ c1 = 1.25
 c2 = 19652
 # the number of iterations to run mcts
 num_iters = 800
+num_games = 1000
 
-def play_game(board : CheckerBoard):
-    game_id = os.getpid() 
+# this is a single process basically
+def play_n_games(pidx):
+    pid = os.getpid()
+    # initialise the xp buffer for this process
+    experience_store = get_experience_store()
+    experience_store.init_buffer(pid)
+    for game in range(num_games):
+        game_id = experience_store.new_game()
+        board = CheckerBoard()
+        # play game to completion
+        winner = play_game(board, game_id, pid)
+        experience_store.add_game_outcome(game_id, winner)
+        # null entry to signify end of game
+        # useful when unrolling trajectories across boundary during training
+        experience_store.end_game()
+
+def play_game(board : CheckerBoard, game_id, pid):
     player_bit = 1 
-    max_num_iters = 100
-    counter = 0
-    history = []
-    while not board.game_over() and counter < max_num_iters:
+    max_timesteps = 100
+    timestep = 0
+    history : list[torch.Tensor] = []
+
+    experience_store = get_experience_store()
+    batch_store = get_batch_store()
+
+    while not board.game_over() and timestep < max_timesteps:
         player = "white" if player_bit else "black"
         board_tensor = board.as_tensor()
         # list of indices corresponding to valid actions, out of the total 10_000
@@ -33,12 +53,12 @@ def play_game(board : CheckerBoard):
             # we create a state that has the player as the last plane
             state_with_player = create_input(board_tensor, player)
             # compute the initial hidden state
-            init_hidden_state = master_store["batch_store"].repr_fn(state_with_player).result()
+            init_hidden_state = batch_store.repr_fn(state_with_player).result()
             # TODO handle actions properly
             action_idx, mcts_policy = run_mcts(init_hidden_state, legal_action_ids, game_id)
             action = legal_actions[action_idx]
             # we don't store the hidden state, but the actual board state
-            master_store["experience_store"].add_experience(game_id, state_with_player, mcts_policy)
+            experience_store.add_experience(pid, game_id, timestep, state_with_player, mcts_policy, player)
 
         # actually execute that action, ie materialises it on the board
         board.execute(action, player)
@@ -48,7 +68,10 @@ def play_game(board : CheckerBoard):
 
         history.append(board_tensor)
         history = history[-history_dim:]
-        counter += 1
+        timestep += 1
+    
+    winner = board.who_won()
+    return winner
 
 def run_mcts(root_hidden_state : torch.Tensor, legal_actions, game_id):
     root = MCTSNode(root_hidden_state, None)
@@ -71,14 +94,15 @@ class MCTSNode:
         # hidden state
         self.state = state 
         # map of action -> child_node
-        self.children = {}
+        self.children : dict[str, MCTSNode] = {}
         self.parent : MCTSNode = parent
         self.count = 0
         self.q_value = 0
 
         self.num_actions = 10_000
         # P(s,a) for all actions
-        self.child_priors, self.value = master_store["batch_store"].policy_fn(self.state).result()
+        batch_store = get_batch_store()
+        self.child_priors, self.value = batch_store.policy_fn(self.state).result()
     
     def __repr__(self):
         print(f"Num Children: {len(self.children)}")
@@ -116,7 +140,8 @@ class MCTSNode:
     
     def expand(self):
         # submit all, they are all independent so we dont need to await them
-        futures = [master_store["batch_store"].dynamics_fn(self.state, action) for action in range(self.num_actions)]
+        batch_store = get_batch_store()
+        futures = [batch_store.dynamics_fn(self.state, action) for action in range(self.num_actions)]
         for action, future in enumerate(futures):
             new_hidden_state = future.result()
             self.children[action] = MCTSNode(new_hidden_state, parent=self)

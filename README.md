@@ -1,6 +1,6 @@
 in progress
 
-todo
+todo:
 
 - DistributedDataParallel
 - unroll loop + gradient updates
