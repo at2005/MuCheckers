@@ -1,17 +1,14 @@
 from models import RepresentationNet, DynamicsNet, PolicyNet, device
-from simulator import CheckerBoard
-from search import play_n_games 
 import torch
 import multiprocessing as mp
 import numpy as np
 from concurrent.futures import Future
-from typing import TypedDict, cast
-from multiprocessing.managers import DictProxy
-
+from collections import defaultdict
+from multiprocessing.sharedctypes import Synchronized
 
 def fetch_num_gpus():
     if device == "mps":
-        return 1
+        return torch.mps.device_count()
     return torch.cuda.device_count()
 
 class BatchStore:
@@ -48,11 +45,34 @@ class BatchStore:
         for (future, repr) in zip(futures, reprs):
             future.set_result(repr)
 
+
+class ExperienceStore:
+    def __init__(self):
+        self.repr_net = RepresentationNet().to(device)
+        self.dynamics_net = DynamicsNet().to(device)
+        self.policy_net = PolicyNet().to(device)
+        self.store = defaultdict(mp.Queue)
+        self.game_store = defaultdict(str)
+        self.game_counter = mp.Value("i", 0, lock=True)
+            
+    def fetch_latest_weights(self):
+        return (self.repr_net, self.dynamics_net, self.policy_net)
+
+
+class DistributedQueues:
+    def __init__(self, experience_queue, game_queue, policy_queue, dynamics_queue, repr_queue, game_counter):
+        self.experience_queue : mp.Queue = experience_queue
+        self.game_queue : mp.Queue = game_queue
+        self.policy_queue : mp.Queue = policy_queue
+        self.dynamics_queue : mp.Queue = dynamics_queue
+        self.repr_queue : mp.Queue = repr_queue
+        self.game_counter : Synchronized = game_counter 
+    
     def repr_fn(self, x):
         future = Future()
         self.repr_queue.put((future, x))
         return future
-        
+    
     def policy_fn(self, x):
         future = Future()
         self.policy_queue.put((future, x))
@@ -62,68 +82,18 @@ class BatchStore:
         future = Future()
         self.dynamics_queue.put((future, h, a))
         return future
-
-class ExperienceStore():
-    def __init__(self):
-        self.repr_net = RepresentationNet().to(device)
-        self.dynamics_net = DynamicsNet().to(device)
-        self.policy_net = PolicyNet().to(device)
-        self.store = {}
-        self.game_store = {}
-        self.game_counter = 0
-        self.counter_lock = mp.Lock()
     
-    def init_buffer(self, pid):
-        if pid not in self.store:
-            self.store[pid] = mp.Queue() 
-        
+    def add_experience(self, game_id, timestep, state, mcts_policy, player):
+        self.experience_queue.put((game_id, timestep, state, mcts_policy, player))
+
     def new_game(self):
-        with self.counter_lock:
-            game_id = self.game_counter
-            self.game_counter += 1
+        with self.game_counter.get_lock():
+            game_id = self.game_counter.value
+            self.game_counter.value += 1
             return game_id
-        
-    def end_game(self, pid):
-        self.add_experience(pid, game_id=None, time=None, state=None, mcts_policy=None, player=None)
-        
+
     def add_game_outcome(self, game_id, winner):
-        self.game_store[game_id] = winner 
-    
-    def fetch_latest_weights(self):
-        return (self.repr_net, self.dynamics_net, self.policy_net)
+        self.game_queue.put((game_id, winner))
 
-    # what do we really need to store here? 
-    # we want to store the root game state, the MCTS generated policy vector
-    # and the game_id
-    def add_experience(self, pid, game_id, timestep, state, mcts_policy, player):
-        self.store[pid].put((game_id, timestep, state, mcts_policy, player))
-
-
-class Store(TypedDict):
-    experience_store : ExperienceStore
-    batch_store : BatchStore
-
-def get_experience_store() -> ExperienceStore:
-    return master_store["experience_store"]
-
-def get_batch_store() -> BatchStore:
-    return master_store["batch_store"]
-
-def init_pool(master_store_,):
-    global master_store
-    master_store : DictProxy[str, Store] = master_store_
-
-def parallel_search():
-    num_processes = 1#mp.cpu_count()
-    with mp.Manager() as manager:
-        master_store: DictProxy[str, Store] = manager.dict()
-        master_store["experience_store"] = ExperienceStore(num_processes)
-        master_store["batch_store"] = BatchStore()
-        with mp.Pool(processes=num_processes, initializer=init_pool, initargs=(master_store,)) as pool:
-            # dummy data
-            pool.map(play_n_games, range(num_processes))
-
-if __name__ == '__main__':
-    from multiprocessing import freeze_support
-    freeze_support()
-    parallel_search()
+    def end_game(self):
+        self.add_experience(game_id=None, time=None, state=None, mcts_policy=None, player=None)
