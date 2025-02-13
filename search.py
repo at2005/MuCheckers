@@ -7,6 +7,7 @@ from infra import ExperienceStore, BatchStore, DistributedQueues
 from models import create_input,history_dim
 import random
 import logging
+import asyncio
 
 # alphazero values
 c1 = 1.25
@@ -62,9 +63,11 @@ def play_game(board : CheckerBoard, game_id, store : DistributedQueues, max_time
             state_with_player = create_input(board_tensor, player)
             # compute the initial hidden state
             store.repr_fn(state_with_player)
+            logging.debug("Polling repr function")
             init_hidden_state = store.poll_repr()
 
             # fetch action and policy
+            logging.debug("Running MCTS")
             action, mcts_policy = run_mcts(init_hidden_state, legal_action_map, store)
             # we don't store the hidden state, but the actual board state
             store.add_experience(game_id, timestep, state_with_player, mcts_policy, player)
@@ -79,8 +82,10 @@ def play_game(board : CheckerBoard, game_id, store : DistributedQueues, max_time
         history.append(board_tensor)
         history = history[-history_dim:]
         timestep += 1
+        logging.debug("Timestep {timestep} completed")
     
     winner = board.who_won()
+    logging.debug(f"Winner {winner}")
     return winner
 
 def run_mcts(root_hidden_state : torch.Tensor, legal_action_map, store: DistributedQueues):
@@ -187,32 +192,41 @@ class MCTSNode:
         next_node = self.children[next_action]
         next_node.traverse()
 
-    
+def batch_process():
+    pass   
+
 def parallel_search():
     num_processes = 1#mp.cpu_count()
     experience_store = ExperienceStore()
     batch_store = BatchStore()
-
-
     xp_processes = [mp.Process(target=play_n_games, args=(DistributedQueues(
-                                                            i,
-                                                            experience_store.store[i],
-                                                            experience_store.game_store,
-                                                            batch_store.policy_queue,
-                                                            batch_store.dynamics_queue, 
-                                                            batch_store.repr_queue,
-                                                            batch_store.policy_results[i],
-                                                            batch_store.repr_results[i],
-                                                            batch_store.dynamics_results[i],
-                                                            experience_store.game_counter),)) for i in range(num_processes)]
+                                                            pid=i,
+                                                            experience_queue=experience_store.store[i],
+                                                            game_queue=experience_store.game_store,
+                                                            policy_queue=batch_store.policy_queue,
+                                                            dynamics_queue=batch_store.dynamics_queue, 
+                                                            repr_queue=batch_store.repr_queue,
+                                                            policyq_sz=batch_store.policy_queue_sz,
+                                                            dynamicsq_sz=batch_store.dynamics_queue_sz,
+                                                            reprq_sz=batch_store.repr_queue_sz,
+                                                            policy_result=batch_store.policy_results[i],
+                                                            dynamics_result=batch_store.dynamics_results[i],
+                                                            repr_result=batch_store.repr_results[i],
+                                                            game_counter=experience_store.game_counter),)) for i in range(num_processes)]
     logging.debug("Starting all parallel tree search")
     for p in xp_processes:
         p.start()
 
-    for p in xp_processes:
-        p.join()
+    return batch_store, experience_store, xp_processes
+
+async def main():
+    batch_store, xp_store, xp_processes = parallel_search()    
+    # now we setup up three coroutines. these can be coroutines bc they are
+    # io bound, not compute bound, ie they only need to submit jobs to the GPU
+    # and write results into a queue
+    await asyncio.gather(batch_store.process_dynamics(), batch_store.process_policy(), batch_store.process_repr())    
 
 
 if __name__ == '__main__':
     mp.freeze_support()
-    parallel_search()
+    asyncio.run(main())

@@ -4,18 +4,25 @@ import multiprocessing as mp
 import numpy as np
 from collections import defaultdict
 from multiprocessing.sharedctypes import Synchronized
+import asyncio
 
 def fetch_num_gpus():
+    if device == "cpu":
+        return 1
     if device == "mps":
         return torch.mps.device_count()
     return torch.cuda.device_count()
 
 class BatchStore:
     def __init__(self):
-        self.batch_size = 32 * fetch_num_gpus()
+        self.batch_size = 3 * fetch_num_gpus()
         self.policy_queue = mp.Queue(maxsize=self.batch_size)
         self.dynamics_queue = mp.Queue(maxsize=self.batch_size)
         self.repr_queue = mp.Queue(maxsize=self.batch_size)
+
+        self.policy_queue_sz = mp.Value("i", 0, lock=True)
+        self.dynamics_queue_sz = mp.Value("i", 0, lock=True)
+        self.repr_queue_sz = mp.Value("i", 0, lock=True)
 
         self.policy_net = PolicyNet().to(device)
         self.repr_net = RepresentationNet().to(device)
@@ -25,36 +32,74 @@ class BatchStore:
         self.dynamics_results = defaultdict(mp.Queue)
         self.repr_results = defaultdict(mp.Queue)
 
+        self.poll_interval = 2
 
-    def process_policy(self):
-        pids, inputs = zip(*[self.policy_queue.get() for _ in range(self.batch_size)])
-        batched_tensor = torch.from_numpy(np.array(inputs)).to(device)
-        
-        policies, values = self.policy_net(batched_tensor).cpu().numpy()
+    async def process_policy(self):
+        while True:
+            with self.policy_queue_sz.get_lock():
+                current_size = self.policy_queue_sz.value
 
-        for pid, policy, value in zip(pids, policies, values):
-            process_queue = self.policy_results[pid]
-            process_queue.put((policy, value))
+            if current_size < self.batch_size:
+                await asyncio.sleep(self.poll_interval)
+                continue
+
+            pids, inputs = zip(*[self.policy_queue.get() for _ in range(self.batch_size)])
+
+            # update size of queue
+            with self.policy_queue_sz.get_lock():
+                self.policy_queue_sz.value -= len(inputs)
+            
+            batched_tensor = torch.from_numpy(np.array(inputs)).to(device)
+            
+            policies, values = self.policy_net(batched_tensor).cpu().numpy()
+
+            for pid, policy, value in zip(pids, policies, values):
+                process_queue = self.policy_results[pid]
+                process_queue.put((policy, value))
 
 
-    def process_dynamics(self):
-        pids, hidden_states, actions = zip(*[self.dynamics_queue.get() for _ in range(self.batch_size)])
-        batched_hidden_states = torch.from_numpy(np.array(hidden_states)).to(device)
-        batched_actions = torch.from_numpy(np.array(actions)).to(device)
-        results = self.dynamics_net(batched_hidden_states, batched_actions).cpu().numpy()
-        for (pid, res) in zip(pids, results):
-            process_queue = self.dynamics_results[pid]
-            process_queue.put(res)
+    async def process_dynamics(self):
+        while True:
+            with self.dynamics_queue_sz.get_lock():
+                current_size = self.dynamics_queue_sz.value
+
+            if current_size < self.batch_size:
+                await asyncio.sleep(self.poll_interval)
+                continue
+            
+            pids, hidden_states, actions = zip(*[self.dynamics_queue.get() for _ in range(self.batch_size)])
+
+            with self.dynamics_queue_sz.get_lock():
+                self.dynamics_queue_sz.value -= len(pids)
+
+            batched_hidden_states = torch.from_numpy(np.array(hidden_states)).to(device)
+            batched_actions = torch.from_numpy(np.array(actions)).to(device)
+            results = self.dynamics_net(batched_hidden_states, batched_actions).cpu().numpy()
+            for (pid, res) in zip(pids, results):
+                process_queue = self.dynamics_results[pid]
+                process_queue.put(res)
 
             
+    async def process_repr(self):
+        while True:
+            with self.repr_queue_sz.get_lock():
+                current_size = self.repr_queue_sz.value
 
-    def process_repr(self):
-        pids, inputs = zip(*[self.repr_net.get() for _ in range(self.batch_size)])
-        batched_tensor = torch.from_numpy(np.array(inputs)).to(device)
-        reprs = self.repr_net(batched_tensor).cpu().numpy()
-        for (pid, repr) in zip(pids, reprs):
-            process_queue = self.repr_results[pid]
-            process_queue.put(repr)
+            if current_size < self.batch_size:
+                await asyncio.sleep(self.poll_interval)
+                continue
+
+            pids, inputs = zip(*[self.repr_net.get() for _ in range(self.batch_size)])
+
+            with self.repr_queue_sz.get_lock():
+                self.repr_queue_sz.value -= len(inputs)
+
+
+            batched_tensor = torch.from_numpy(np.array(inputs)).to(device)
+            reprs = self.repr_net(batched_tensor).cpu().numpy()
+            for (pid, repr) in zip(pids, reprs):
+                process_queue = self.repr_results[pid]
+                process_queue.put(repr)
         
 
 class ExperienceStore:
@@ -71,7 +116,7 @@ class ExperienceStore:
 
 
 class DistributedQueues:
-    def __init__(self, pid, experience_queue, game_queue, policy_queue, dynamics_queue, repr_queue, policy_result, repr_result, dynamics_result, game_counter):
+    def __init__(self, pid, experience_queue, game_queue, policy_queue, dynamics_queue, repr_queue, policyq_sz, dynamicsq_sz, reprq_sz, policy_result, repr_result, dynamics_result, game_counter):
         self.pid = pid
         self.experience_queue : mp.Queue = experience_queue
         self.game_queue : mp.Queue = game_queue
@@ -79,11 +124,14 @@ class DistributedQueues:
         self.dynamics_queue : mp.Queue = dynamics_queue
         self.repr_queue : mp.Queue = repr_queue
         self.game_counter : Synchronized = game_counter
+        self.repr_queue_sz : Synchronized = reprq_sz
+        self.policy_queue_sz : Synchronized = policyq_sz
+        self.dynamics_queue_sz : Synchronized = dynamicsq_sz
 
         self.policy_result : mp.Queue = policy_result
         self.dynamics_result : mp.Queue = dynamics_result
         self.repr_result : mp.Queue = repr_result
-    
+
     def poll_policy(self):
         return self.policy_result.get()
 
@@ -94,15 +142,20 @@ class DistributedQueues:
         return self.repr_result.get()
 
     def repr_fn(self, x):
-        self.repr_queue.put((self.pid, x))        
+        with self.repr_queue_sz.get_lock():
+            self.repr_queue.put((self.pid, x))        
+            self.repr_queue_sz.value += 1
 
     def policy_fn(self, x):
-        self.policy_queue.put((self.pid, x))
+        with self.policy_queue_sz.get_lock():
+            self.policy_queue.put((self.pid, x))
+            self.policy_queue_sz.value += 1
 
     def dynamics_fn(self, h, a):
-        self.dynamics_queue.put((self.pid, h, a))
+        with self.dynamics_queue_sz.get_lock():
+            self.dynamics_queue.put((self.pid, h, a))
+            self.dynamics_queue_sz.value += 1
         
-
     
     def add_experience(self, game_id, timestep, state, mcts_policy, player):
         self.experience_queue.put((game_id, timestep, state, mcts_policy, player))
