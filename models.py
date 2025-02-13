@@ -8,6 +8,8 @@ unroll_steps = 5
 num_actions = 10**2 * 10**2
 device = "cpu"
 
+
+# this appends a homogeneous plane to the board state indicating the player
 def create_input(board_state: torch.Tensor, player : str):
     # board state is (B, C x History, H, W)
     b,c,h,w = board_state.shape

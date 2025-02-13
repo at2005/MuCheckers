@@ -7,7 +7,6 @@ from infra import ExperienceStore, BatchStore, DistributedQueues
 from models import create_input,history_dim
 import random
 import logging
-from concurrent.futures import Future
 
 # alphazero values
 c1 = 1.25
@@ -16,28 +15,23 @@ c2 = 19652
 num_iters = 800
 num_games = 1000
 
-def repr_net(store: DistributedQueues, x):
-    return store.repr_fn(x).result()
-
-def policy_net(store : DistributedQueues, x):
-    return store.policy_fn(x).result()
 
 # this is a single process basically
-def play_n_games(pidx, buffer : DistributedQueues):
+def play_n_games(buffer : DistributedQueues):
     for _ in range(num_games):
         game_id = buffer.new_game()
         logging.debug(f"Starting game {game_id}")
         board = CheckerBoard()
         # play game to completion
-        winner = play_game(board, game_id, pidx, buffer)
+        winner = play_game(board, game_id, buffer)
         buffer.add_game_outcome(game_id, winner)
         # null entry to signify end of game
         # useful when unrolling trajectories across boundary during training
         buffer.end_game()
-        logging.debug(f"Game over for {pidx} with winner {winner}")
+        logging.debug(f"Game over for {buffer.pid} with winner {winner}")
 
 
-def play_game(board : CheckerBoard, game_id, pid, store : DistributedQueues, max_timesteps=100) -> str:
+def play_game(board : CheckerBoard, game_id, store : DistributedQueues, max_timesteps=100) -> str:
     player_bit = 1 
     timestep = 0
     history : list[torch.Tensor] = []
@@ -67,12 +61,13 @@ def play_game(board : CheckerBoard, game_id, pid, store : DistributedQueues, max
             # we create a state that has the player as the last plane
             state_with_player = create_input(board_tensor, player)
             # compute the initial hidden state
-            init_hidden_state = repr_net(store, state_with_player)
+            store.repr_fn(state_with_player)
+            init_hidden_state = store.poll_repr()
 
             # fetch action and policy
             action, mcts_policy = run_mcts(init_hidden_state, legal_action_map, store)
             # we don't store the hidden state, but the actual board state
-            store.add_experience(pid, game_id, timestep, state_with_player, mcts_policy, player)
+            store.add_experience(game_id, timestep, state_with_player, mcts_policy, player)
 
         # actually execute that action, ie materialises it on the board
         # action is a src -> dest tensor
@@ -120,7 +115,8 @@ class MCTSNode:
         # to allow only legal ones
         self.num_actions = 10_000
         # P(s,a) for all actions
-        self.action_policy, self.value = policy_net(self.store, self.state)
+        self.store.policy_fn(self.state)
+        self.action_policy, self.value = self.store.poll_policy()
     
     def __repr__(self):
         print(f"Num Children: {len(self.children)}")
@@ -172,9 +168,11 @@ class MCTSNode:
     
     def expand(self):
         # submit all, they are all independent so we dont need to await them
-        futures = [self.store.dynamics_fn(self.state, action) for action in range(self.num_actions)]
-        for action, future in enumerate(futures):
-            new_hidden_state = future.result()
+        for action in range(self.num_actions):
+            self.store.dynamics_fn(self.state, action)
+        
+        for action in range(self.num_actions):
+            new_hidden_state = self.store.poll_dynamics()
             self.add_child(action, new_hidden_state)
 
     def traverse(self):
@@ -189,19 +187,24 @@ class MCTSNode:
         next_node = self.children[next_action]
         next_node.traverse()
 
-
     
-
 def parallel_search():
     num_processes = 1#mp.cpu_count()
     experience_store = ExperienceStore()
     batch_store = BatchStore()
-    xp_processes = [mp.Process(target=play_n_games, args=(i,DistributedQueues(experience_store.store[i],
+
+
+    xp_processes = [mp.Process(target=play_n_games, args=(DistributedQueues(
+                                                            i,
+                                                            experience_store.store[i],
                                                             experience_store.game_store,
                                                             batch_store.policy_queue,
                                                             batch_store.dynamics_queue, 
                                                             batch_store.repr_queue,
-                                                            experience_store.game_counter))) for i in range(num_processes)]
+                                                            batch_store.policy_results[i],
+                                                            batch_store.repr_results[i],
+                                                            batch_store.dynamics_results[i],
+                                                            experience_store.game_counter),)) for i in range(num_processes)]
     logging.debug("Starting all parallel tree search")
     for p in xp_processes:
         p.start()
