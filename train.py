@@ -66,13 +66,21 @@ class Trainer:
         value_loss_fn = nn.MSELoss()
 
         loss = torch.tensor(0.0, device=device)
+        
+        def player_to_reward(player, winner):
+            if winner == "draw":
+                return 0
+            winner_bit = 1 if winner == "white" else 0
+            player_bit = 1 if player == "white" else 0
+            return -1 ** (player_bit ^ winner_bit)
+
 
         for t in range(unroll_steps):
             # for each element in the unroll loop we iterate over each batch and compute its state
             batch_state = torch.stack([torch.from_numpy(trajectory[t].state) for trajectory in batch])
             batch_policy_predicted, batch_value_predicted = self.policy(self.repr(batch_state))
             batch_policy_targets = torch.stack([torch.from_numpy(trajectory[t].mcts_policy) for trajectory in batch])
-            batch_value_targets = torch.stack([self.experience_buffer.game_store[trajectory[t].game_id] for trajectory in batch])
+            batch_value_targets = torch.Tensor([player_to_reward(trajectory[t].player, self.experience_buffer.game_store[trajectory[t].game_id]) for trajectory in batch]).view(-1, 1)
             policy_term = kl_loss_fn(torch.log(batch_policy_predicted), batch_policy_targets)                
             value_term = value_loss_fn(batch_value_predicted, batch_value_targets)
             loss += policy_term + value_term

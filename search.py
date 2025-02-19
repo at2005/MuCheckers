@@ -25,7 +25,7 @@ def play_n_games(buffer : DistributedQueues):
         board = CheckerBoard()
         # play game to completion
         winner = play_game(board, game_id, buffer)
-        buffer.add_game_outcome(game_id, 1 if winner == "white" else 0)
+        buffer.add_game_outcome(game_id, winner)
         logging.debug(f"Game over for {buffer.pid} with winner {winner}")
 
 
