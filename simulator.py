@@ -27,18 +27,26 @@ class CheckerBoard:
     def check_valid_move(self, player_board, opponent_board, x, y):
         return self.check_bounds(x, y) and opponent_board[x][y] == 0 and player_board[x][y] == 0
 
-    def flattened_action_to_tesseract(self, action_idx):
-        board_dim_sq = self.board_dim ** 2
+    @staticmethod
+    def action_idx_to_board(action_idx):
+        board_dim = 10
+        board_dim_sq = board_dim ** 2
         src_term = action_idx // board_dim_sq 
         dest_term = action_idx % board_dim_sq
 
-        i = src_term // self.board_dim
-        j = src_term % self.board_dim
+        i = src_term // board_dim
+        j = src_term % board_dim
 
-        x = dest_term // self.board_dim
-        y = dest_term % self.board_dim
+        x = dest_term // board_dim
+        y = dest_term % board_dim
 
-        return (i,j), (x,y)
+        board = np.zeros((board_dim, board_dim, 2))
+        src_board = board[:, :, 0]
+        dest_board = board[:, :, 1]
+        src_board[i][j] = 1.0
+        dest_board[i][j] = 1.0
+
+        return board
 
 
     def get_valid_actions(self, player) -> dict:

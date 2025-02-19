@@ -106,4 +106,9 @@ class DynamicsNet(nn.Module):
         x = F.relu(self.batch_norm(self.conv_block(state)))
         for block in self.blocks:
             x = F.relu(x + block(x))
+
+        # scale gradient by 1/2, that's what muzero does
+        # to ensure the total gradient applied here
+        # stays constant
+        x.register_hook(lambda grad: grad*0.5)
         return x 

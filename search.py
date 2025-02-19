@@ -25,10 +25,7 @@ def play_n_games(buffer : DistributedQueues):
         board = CheckerBoard()
         # play game to completion
         winner = play_game(board, game_id, buffer)
-        buffer.add_game_outcome(game_id, winner)
-        # null entry to signify end of game
-        # useful when unrolling trajectories across boundary during training
-        buffer.end_game()
+        buffer.add_game_outcome(game_id, 1 if winner == "white" else 0)
         logging.debug(f"Game over for {buffer.pid} with winner {winner}")
 
 
@@ -174,7 +171,7 @@ class MCTSNode:
     def expand(self):
         # submit all, they are all independent so we dont need to await them
         for action in range(self.num_actions):
-            self.store.dynamics_fn(self.state, action)
+            self.store.dynamics_fn(self.state, CheckerBoard.action_idx_to_board(action))
         
         for action in range(self.num_actions):
             new_hidden_state = self.store.poll_dynamics()
@@ -191,9 +188,6 @@ class MCTSNode:
         next_action = self.select()
         next_node = self.children[next_action]
         next_node.traverse()
-
-def batch_process():
-    pass   
 
 def parallel_search():
     num_processes = 1#mp.cpu_count()
@@ -224,7 +218,12 @@ async def main():
     # now we setup up three coroutines. these can be coroutines bc they are
     # io bound, not compute bound, ie they only need to submit jobs to the GPU
     # and write results into a queue
-    await asyncio.gather(batch_store.process_dynamics(), batch_store.process_policy(), batch_store.process_repr())    
+    await asyncio.gather(batch_store.process_dynamics(), 
+                         batch_store.process_policy(), 
+                         batch_store.process_repr(), 
+                         batch_store.update_weights(),
+                         xp_store.update_game_store(),
+                         xp_store.write_queue_to_list())    
 
 
 if __name__ == '__main__':
